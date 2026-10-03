@@ -10,7 +10,8 @@ fn main() -> std::io::Result<()> {
     let mut counter: u64 = 0;
 
     loop {
-        sock.send_to(&counter.to_be_bytes(), &target).unwrap();
+        sock.send_to(&counter.to_be_bytes(), &target)
+            .expect("send_to failed");
         counter += 1;
     }
 }
