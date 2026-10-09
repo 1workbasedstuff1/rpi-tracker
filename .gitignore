@@ -1,1 +1,12 @@
 **/target/
+
+# in multi-camera-geometry/ i want to ignore all 
+# all unecessary files
+# __pycache__/
+# build/
+# dist/
+# wheels/
+# *.egg-info/
+#
+# .venv
+# *.pt
