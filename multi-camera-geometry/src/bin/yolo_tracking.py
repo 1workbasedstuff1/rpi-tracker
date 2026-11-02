@@ -7,9 +7,8 @@ Install:
 Usage:
     python track_people.py --model yolov8n.pt
     python track_people.py --model yolov8n.engine --no-show      # headless, TensorRT
-    python track_people.py --model yolov8n.pt --no-undistort
 
-Keys (when the window is shown): u = toggle undistortion, q = quit
+Keys (when the window is shown): q = quit
 """
 import argparse
 import threading
@@ -91,6 +90,15 @@ def load_undistort_maps():
     return map1, map2, new_K
 
 
+def print_estimation_calibration(new_K):
+    """Print the intrinsic matrix that must accompany the output pixels."""
+    print("ESTIMATION camera_model=pinhole_undistorted")
+    print(f"ESTIMATION image_size={WIDTH}x{HEIGHT}")
+    print("ESTIMATION K_new=")
+    print(new_K)
+    print(f"ESTIMATION K_new_flat={new_K.reshape(-1).tolist()}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="Path to YOLO weights (.pt / .engine / .onnx)")
@@ -98,7 +106,6 @@ def main():
     ap.add_argument("--imgsz", type=int, default=640, help="YOLO inference size")
     ap.add_argument("--max-age", type=int, default=30, help="Frames to keep a lost track alive")
     ap.add_argument("--n-init", type=int, default=3, help="Detections needed to confirm a track")
-    ap.add_argument("--no-undistort", action="store_true", help="Skip lens undistortion")
     ap.add_argument("--no-show", action="store_true", help="Headless: don't open a window")
     args = ap.parse_args()
 
@@ -118,11 +125,14 @@ def main():
         bgr=True,  # we feed OpenCV BGR frames
     )
 
-    undistort_on = not args.no_undistort
-    map1 = map2 = None
-    if undistort_on:
-        map1, map2, new_K = load_undistort_maps()
-        print("Centres are in undistorted pixel coords; use new_K downstream:\n", new_K)
+    map1, map2, new_K = load_undistort_maps()
+    print_estimation_calibration(new_K)
+
+    # NOTE: The pipeline is raw camera image -> lens undistortion -> detection.
+    # Send each reported z=[u,v], this new_K, and the matching camera pose/IMU
+    # data to reference.py. z is already in undistorted pixel coordinates;
+    # do not multiply it by K or undistort it again. The original calibration K
+    # describes raw distorted pixels, while new_K describes these output pixels.
 
     cap = open_camera()
     reader = LatestFrameReader(cap)
@@ -136,8 +146,7 @@ def main():
                 time.sleep(0.001)
                 continue
 
-            if undistort_on:
-                frame = cv2.remap(frame, map1, map2, interpolation=cv2.INTER_LINEAR)
+            frame = cv2.remap(frame, map1, map2, interpolation=cv2.INTER_LINEAR)
 
             # --- YOLO: people only ---
             predict_kwargs = dict(
@@ -168,7 +177,10 @@ def main():
                     continue
                 l, t, r, b = track.to_ltrb()
                 cx, cy = (l + r) / 2.0, (t + b) / 2.0
-                print(f"id={track.track_id} centre=({cx:.1f}, {cy:.1f})")
+                print(
+                    f"ESTIMATION frame_id={last_id} track_id={track.track_id} "
+                    f"z_undistorted=[{cx:.3f}, {cy:.3f}]"
+                )
 
                 if not args.no_show:
                     cv2.rectangle(frame, (int(l), int(t)), (int(r), int(b)), (0, 255, 0), 2)
@@ -182,14 +194,12 @@ def main():
                 n, t0 = 0, time.time()
 
             if not args.no_show:
-                cv2.putText(frame, f"undistort: {undistort_on}", (10, 30),
+                cv2.putText(frame, "undistort: on (new_K)", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.imshow("People Tracking", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                if key == ord("u") and map1 is not None:
-                    undistort_on = not undistort_on
     except KeyboardInterrupt:
         pass
     finally:

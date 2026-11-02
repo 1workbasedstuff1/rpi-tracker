@@ -22,7 +22,9 @@ from hailo_platform import (HEF, ConfigureParams, FormatType, HailoStreamInterfa
                             InferVStreams, InputVStreamParams, OutputVStreamParams, VDevice)
 
 CAM_INDEX = 4
-WIDTH, HEIGHT, FPS = 1280, 720, 30
+WIDTH, HEIGHT, FPS = 1280, 720, 30  # MUST match the calibration resolution
+CALIB_FILE = "camera_intrinsics.npz"
+ALPHA = 0.0  # 0 = crop to valid pixels, 1 = retain the full field of view
 
 # Standard Pytorch_Retinaface settings (what the Model Zoo network was trained with)
 MIN_SIZES = {8: [16, 32], 16: [64, 128], 32: [256, 512]}
@@ -63,6 +65,31 @@ def open_camera():
     cap.set(cv2.CAP_PROP_FPS, FPS)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+def load_undistort_maps():
+    data = np.load(CALIB_FILE)
+    K, dist = data["K"], data["dist"]
+    calib_w, calib_h = (int(v) for v in data["image_size"])
+    assert (calib_w, calib_h) == (WIDTH, HEIGHT), (
+        f"Calibrated at {calib_w}x{calib_h} but streaming at {WIDTH}x{HEIGHT}"
+    )
+    new_K, _ = cv2.getOptimalNewCameraMatrix(
+        K, dist, (WIDTH, HEIGHT), ALPHA, (WIDTH, HEIGHT)
+    )
+    map1, map2 = cv2.initUndistortRectifyMap(
+        K, dist, None, new_K, (WIDTH, HEIGHT), cv2.CV_16SC2
+    )
+    return map1, map2, new_K
+
+
+def print_estimation_calibration(new_K):
+    """Print the intrinsic matrix that must accompany the output pixels."""
+    print("ESTIMATION camera_model=pinhole_undistorted")
+    print(f"ESTIMATION image_size={WIDTH}x{HEIGHT}")
+    print("ESTIMATION K_new=")
+    print(new_K)
+    print(f"ESTIMATION K_new_flat={new_K.reshape(-1).tolist()}")
 
 
 def letterbox(img, in_w, in_h):
@@ -158,6 +185,16 @@ def main():
     for o in hef.get_output_vstream_infos():
         print("output:", o.name, o.shape)
 
+    map1, map2, new_K = load_undistort_maps()
+    print_estimation_calibration(new_K)
+
+    # NOTE: The pipeline is raw camera image -> lens undistortion -> letterbox
+    # -> Hailo detection -> undo letterbox. Send each reported z=[u,v], this
+    # new_K, and the matching camera pose/IMU data to reference.py. z is already
+    # in undistorted pixel coordinates; do not multiply it by K or undistort it
+    # again. The original calibration K describes raw distorted pixels, while
+    # new_K describes these output pixels.
+
     cap = open_camera()
     reader = LatestFrameReader(cap)
 
@@ -181,13 +218,16 @@ def main():
                         time.sleep(0.001)
                         continue
 
+                    frame = cv2.remap(
+                        frame, map1, map2, interpolation=cv2.INTER_LINEAR
+                    )
                     inp, scale, px, py = letterbox(frame, in_w, in_h)
                     if args.rgb:
                         inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
                     outs = pipe.infer({in_info.name: inp[None]})
                     boxes, scores, lms = decode(outs, in_w, in_h, args.conf, args.nms)
 
-                    # back to original frame coordinates
+                    # Back to the full-resolution undistorted-frame coordinates.
                     boxes[:, [0, 2]] = (boxes[:, [0, 2]] - px) / scale
                     boxes[:, [1, 3]] = (boxes[:, [1, 3]] - py) / scale
                     lms[..., 0] = (lms[..., 0] - px) / scale
@@ -195,7 +235,11 @@ def main():
 
                     for (x1, y1, x2, y2), s, pts in zip(boxes, scores, lms):
                         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                        print(f"face centre=({cx:.1f}, {cy:.1f}) score={s:.2f}")
+                        print(
+                            f"ESTIMATION frame_id={last_id} "
+                            f"z_undistorted=[{cx:.3f}, {cy:.3f}] "
+                            f"score={s:.3f}"
+                        )
                         if not args.no_show:
                             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
                             for px_, py_ in pts:
